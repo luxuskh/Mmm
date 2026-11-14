@@ -1,7 +1,9 @@
 #!/usr/bin/env python3
 import os
+import platform
 import subprocess
 import sys
+import tarfile
 import time
 import urllib.request
 
@@ -20,6 +22,47 @@ def run_cmd(cmd, shell=False):
         sys.exit(1)
 
 
+def install_tailscale_static():
+    """Скачивает и распаковывает статические бинарники Tailscale без curl/wget."""
+    machine = platform.machine().lower()
+    if machine in ("x86_64", "amd64"):
+        arch = "amd64"
+    elif machine in ("aarch64", "arm64"):
+        arch = "arm64"
+    else:
+        print(f"[!] Неподдерживаемая архитектура: {machine}", file=sys.stderr)
+        sys.exit(1)
+
+    # Получаем актуальную версию стабильной ветки
+    version_url = (
+        f"https://pkgs.tailscale.com/stable/?mode=json&os=linux&arch={arch}"
+    )
+    import json
+
+    with urllib.request.urlopen(version_url) as resp:
+        data = json.loads(resp.read().decode("utf-8"))
+        tarball_name = data["Tarballs"][arch]
+
+    download_url = f"https://pkgs.tailscale.com/stable/{tarball_name}"
+    tar_path = "/tmp/tailscale.tgz"
+
+    print(f"[+] Скачивание {tarball_name}...")
+    urllib.request.urlretrieve(download_url, tar_path)
+
+    print("[+] Распаковка бинарников в /usr/local/bin...")
+    with tarfile.open(tar_path, "r:gz") as tar:
+        for member in tar.getmembers():
+            if member.name.endswith("/tailscale") or member.name.endswith(
+                "/tailscaled"
+            ):
+                member.name = os.path.basename(member.name)
+                tar.extract(member, path="/usr/local/bin")
+
+    os.chmod("/usr/local/bin/tailscale", 0o755)
+    os.chmod("/usr/local/bin/tailscaled", 0o755)
+    os.remove(tar_path)
+
+
 def main():
     if os.geteuid() != 0:
         print(
@@ -27,56 +70,42 @@ def main():
         )
         sys.exit(1)
 
-    # 1. Скачиваем и запускаем установщик через Python (без curl)
-    print("[+] Скачивание и установка Tailscale...")
-    install_script = "/tmp/install_tailscale.sh"
-    urllib.request.urlretrieve(
-        "https://tailscale.com/install.sh", install_script
-    )
-    run_cmd(["sh", install_script])
+    install_tailscale_static()
 
-    # 2. Запуск демона tailscaled напрямую в фоне (без systemd)
     print("[+] Запуск демона tailscaled в фоновом режиме...")
     os.makedirs("/var/run/tailscale", exist_ok=True)
     os.makedirs("/var/lib/tailscale", exist_ok=True)
 
     daemon_cmd = [
-        "tailscaled",
+        "/usr/local/bin/tailscaled",
         "--state=/var/lib/tailscale/tailscaled.state",
         "--socket=/var/run/tailscale/tailscaled.sock",
     ]
-    # Если в контейнере отсутствует /dev/net/tun, переключаемся в userspace-режим
     if not os.path.exists("/dev/net/tun"):
-        print(
-            "[*] /dev/net/tun не найден, используется режим"
-            " userspace-networking"
-        )
+        print("[*] /dev/net/tun не найден, включаем userspace-networking")
         daemon_cmd.append("--tun=userspace-networking")
 
     subprocess.Popen(daemon_cmd)
-    time.sleep(3)  # Даём демону 3 секунды на инициализацию сокета
+    time.sleep(3)
 
-    # 3. Авторизация узла и включение Tailscale SSH
     print("[+] Подключение к сети и включение Tailscale SSH...")
     run_cmd([
-        "tailscale",
+        "/usr/local/bin/tailscale",
         "--socket=/var/run/tailscale/tailscaled.sock",
         "up",
         f"--authkey={TAILSCALE_AUTH_KEY}",
         "--ssh",
     ])
 
-    # 4. Проверка статуса
     print("\n[+] Готово! Выданный IP-адрес в сети Tailscale:")
     run_cmd([
-        "tailscale",
+        "/usr/local/bin/tailscale",
         "--socket=/var/run/tailscale/tailscaled.sock",
         "ip",
         "-4",
     ])
 
-    # Удерживаем процесс активным, чтобы контейнер не завершился после настройки
-    print("[*] Контейнер работает и доступен по Tailscale SSH...")
+    print("[*] Контейнер активен и готов принимать подключения по SSH...")
     while True:
         time.sleep(3600)
 
