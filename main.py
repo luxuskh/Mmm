@@ -1,6 +1,9 @@
 #!/usr/bin/env python3
+import gzip
+import json
 import os
 import platform
+import shutil
 import subprocess
 import sys
 import tarfile
@@ -10,85 +13,81 @@ import urllib.request
 TAILSCALE_AUTH_KEY = (
     "tskey-auth-kSDCXpyPbB11CNTRL-N53LaNp5ic1M6sWesKFTc1TH2LkstkRVM"
 )
+HOME_SERVER_IP = "100.124.185.95"
+HOME_SERVER_PORT = "80"  # 80 = Nginx/Hub, 8096 = Jellyfin, 8080 = Filebrowser
+PROXY_PORT = "1080"
+GATEWAY_PORT = "8080"
 
 
-def run_cmd(cmd, shell=False):
-    """Выполняет системную команду и проверяет код возврата."""
-    print(f"[*] Выполняю: {' '.join(cmd) if isinstance(cmd, list) else cmd}")
-    try:
-        subprocess.run(cmd, shell=shell, check=True)
-    except subprocess.CalledProcessError as e:
-        print(f"[!] Ошибка при выполнении команды: {e}", file=sys.stderr)
-        sys.exit(1)
+def run_cmd(cmd):
+    subprocess.run(cmd, check=True)
 
 
-def install_tailscale_static():
-    """Скачивает и распаковывает статические бинарники Tailscale без curl/wget."""
-    machine = platform.machine().lower()
-    if machine in ("x86_64", "amd64"):
-        arch = "amd64"
-    elif machine in ("aarch64", "arm64"):
-        arch = "arm64"
-    else:
-        print(f"[!] Неподдерживаемая архитектура: {machine}", file=sys.stderr)
-        sys.exit(1)
+def get_arch():
+    m = platform.machine().lower()
+    return "amd64" if m in ("x86_64", "amd64") else "arm64"
 
-    # Получаем актуальную версию стабильной ветки
-    version_url = (
+
+def install_tailscale_static(arch):
+    if os.path.exists("/usr/local/bin/tailscale") and os.path.exists(
+        "/usr/local/bin/tailscaled"
+    ):
+        return
+    url_info = (
         f"https://pkgs.tailscale.com/stable/?mode=json&os=linux&arch={arch}"
     )
-    import json
-
-    with urllib.request.urlopen(version_url) as resp:
-        data = json.loads(resp.read().decode("utf-8"))
-        tarball_name = data["Tarballs"][arch]
-
-    download_url = f"https://pkgs.tailscale.com/stable/{tarball_name}"
+    with urllib.request.urlopen(url_info) as resp:
+        tarball = json.loads(resp.read().decode())["Tarballs"][arch]
     tar_path = "/tmp/tailscale.tgz"
-
-    print(f"[+] Скачивание {tarball_name}...")
-    urllib.request.urlretrieve(download_url, tar_path)
-
-    print("[+] Распаковка бинарников в /usr/local/bin...")
+    urllib.request.urlretrieve(
+        f"https://pkgs.tailscale.com/stable/{tarball}", tar_path
+    )
     with tarfile.open(tar_path, "r:gz") as tar:
         for member in tar.getmembers():
-            if member.name.endswith("/tailscale") or member.name.endswith(
-                "/tailscaled"
-            ):
+            if member.name.endswith(("/tailscale", "/tailscaled")):
                 member.name = os.path.basename(member.name)
                 tar.extract(member, path="/usr/local/bin")
-
     os.chmod("/usr/local/bin/tailscale", 0o755)
     os.chmod("/usr/local/bin/tailscaled", 0o755)
     os.remove(tar_path)
 
 
+def install_gost_static(arch):
+    gost_bin = "/usr/local/bin/gost"
+    if os.path.exists(gost_bin):
+        return
+    gost_arch = "amd64" if arch == "amd64" else "armv8"
+    url = f"https://github.com/ginuerzh/gost/releases/download/v2.11.5/gost-linux-{gost_arch}-2.11.5.gz"
+    gz_path = "/tmp/gost.gz"
+    urllib.request.urlretrieve(url, gz_path)
+    with gzip.open(gz_path, "rb") as f_in, open(gost_bin, "wb") as f_out:
+        shutil.copyfileobj(f_in, f_out)
+    os.chmod(gost_bin, 0o755)
+    os.remove(gz_path)
+
+
 def main():
-    if os.geteuid() != 0:
-        print(
-            "[!] Скрипт необходимо запускать с правами root.", file=sys.stderr
-        )
-        sys.exit(1)
+    arch = get_arch()
+    install_tailscale_static(arch)
+    install_gost_static(arch)
 
-    install_tailscale_static()
-
-    print("[+] Запуск демона tailscaled в фоновом режиме...")
     os.makedirs("/var/run/tailscale", exist_ok=True)
     os.makedirs("/var/lib/tailscale", exist_ok=True)
 
+    # 1. Tailscale daemon с локальным SOCKS5-мостом на 127.0.0.1:1055
     daemon_cmd = [
         "/usr/local/bin/tailscaled",
         "--state=/var/lib/tailscale/tailscaled.state",
         "--socket=/var/run/tailscale/tailscaled.sock",
+        "--socks5-server=127.0.0.1:1055",
     ]
     if not os.path.exists("/dev/net/tun"):
-        print("[*] /dev/net/tun не найден, включаем userspace-networking")
         daemon_cmd.append("--tun=userspace-networking")
 
     subprocess.Popen(daemon_cmd)
     time.sleep(3)
 
-    print("[+] Подключение к сети и включение Tailscale SSH...")
+    # 2. Авторизация в Tailscale + SSH
     run_cmd([
         "/usr/local/bin/tailscale",
         "--socket=/var/run/tailscale/tailscaled.sock",
@@ -97,15 +96,34 @@ def main():
         "--ssh",
     ])
 
-    print("\n[+] Готово! Выданный IP-адрес в сети Tailscale:")
-    run_cmd([
-        "/usr/local/bin/tailscale",
-        "--socket=/var/run/tailscale/tailscaled.sock",
-        "ip",
-        "-4",
+    # 3. SOCKS5/HTTP прокси на порту 1080
+    subprocess.Popen(["/usr/local/bin/gost", f"-L=:{PROXY_PORT}"])
+
+    # 4. Публичный шлюз на порту 8080 -> домашний сервер через Tailscale
+    subprocess.Popen([
+        "/usr/local/bin/gost",
+        f"-L=tcp://:{GATEWAY_PORT}/{HOME_SERVER_IP}:{HOME_SERVER_PORT}",
+        "-F=socks5://127.0.0.1:1055",
     ])
 
-    print("[*] Контейнер активен и готов принимать подключения по SSH...")
+    ts_ip = (
+        subprocess.check_output([
+            "/usr/local/bin/tailscale",
+            "--socket=/var/run/tailscale/tailscaled.sock",
+            "ip",
+            "-4",
+        ])
+        .decode()
+        .strip()
+    )
+
+    print(f"[✓] SSH: ssh root@{ts_ip}")
+    print(f"[✓] Proxy (SOCKS5/HTTP): {ts_ip}:{PROXY_PORT}")
+    print(
+        f"[✓] Public Gateway: port {GATEWAY_PORT} ->"
+        f" {HOME_SERVER_IP}:{HOME_SERVER_PORT}"
+    )
+
     while True:
         time.sleep(3600)
 
