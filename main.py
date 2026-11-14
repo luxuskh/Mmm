@@ -5,13 +5,15 @@ import os
 import platform
 import shutil
 import subprocess
-import sys
 import tarfile
 import time
 import urllib.request
 
 DEFAULT_KEY = "tskey-auth-ktWvVMtWXs11CNTRL-fSJwj3GG3UAgZFdVbWXoTA4b9WAWGH5w"
 TAILSCALE_AUTH_KEY = os.environ.get("TAILSCALE_AUTH_KEY", DEFAULT_KEY).strip()
+
+PROXY_USER = os.environ.get("PROXY_USER", "myuser").strip()
+PROXY_PASS = os.environ.get("PROXY_PASS", "mypass123").strip()
 
 HOME_SERVER_IP = "100.124.185.95"
 HOME_SERVER_PORT = "80"  # 80 = Nginx/Hub, 8096 = Jellyfin, 8080 = Filebrowser
@@ -96,8 +98,10 @@ def main():
         "--ssh",
     ])
 
-    # 3. SOCKS5/HTTP прокси на порту 1080
-    subprocess.Popen(["/usr/local/bin/gost", f"-L=:{PROXY_PORT}"])
+    # 3. Публичный SOCKS5/HTTP прокси с паролем на порту 1080
+    subprocess.Popen(
+        ["/usr/local/bin/gost", f"-L={PROXY_USER}:{PROXY_PASS}@:{PROXY_PORT}"]
+    )
 
     # 4. Публичный шлюз на порту 8080 -> домашний сервер через Tailscale
     subprocess.Popen([
@@ -119,10 +123,14 @@ def main():
 
     print("\n" + "=" * 50, flush=True)
     print(f"[✓] SSH: ssh root@{ts_ip}", flush=True)
-    print(f"[✓] Proxy (SOCKS5/HTTP): {ts_ip}:{PROXY_PORT}", flush=True)
     print(
-        f"[✓] Public Gateway: port {GATEWAY_PORT} ->"
-        f" {HOME_SERVER_IP}:{HOME_SERVER_PORT}",
+        f"[✓] Public Proxy: centerbeam.proxy.rlwy.net:45145"
+        f" ({PROXY_USER}:{PROXY_PASS})",
+        flush=True,
+    )
+    print(
+        f"[✓] Public Gateway: https://worker-production-bef89883.up.railway.app"
+        f" -> {HOME_SERVER_IP}:{HOME_SERVER_PORT}",
         flush=True,
     )
     print("=" * 50 + "\n", flush=True)
